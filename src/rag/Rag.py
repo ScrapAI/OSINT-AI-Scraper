@@ -1,132 +1,105 @@
-from langchain_core.globals import set_verbose, set_debug
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import FastEmbedEmbeddings
-from langchain_core.documents import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import asyncio
+from sentence_transformers import SentenceTransformer
+import faiss
 import os
 import shutil
+from typing import List, Dict
+
 
 class Rag:
-    def __init__(self, index_path='chroma_db'):
-        # set_debug(True)
-        # set_verbose(True)
-        
+    def __init__(self, index_path='faiss_index'):
         self.index_path = index_path
-        self.embeddings = FastEmbedEmbeddings()
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1024,
-            chunk_overlap=100
-        )
-        
-        # Création d'une nouvelle session
-        self._initialize_session()
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # Modèle SentenceTransformers
+        self.index = self._load_or_create_index()
 
-    def _initialize_session(self):
-        """Initialise ou charge une session existante"""
-        try:
-            self.vector_store = Chroma(
-                persist_directory=self.index_path,
-                embedding_function=self.embeddings
-            )
-        except Exception as e:
-            print(f"Création d'une nouvelle base de connaissances: {str(e)}")
-            self.vector_store = None
-
-    def add(self, docs: dict):
-        """Ajoute des documents à la base de connaissances"""
-        documents = []
-        for doc_id, (title, link, content) in docs.items():
-            # Découpage du contenu en chunks si nécessaire
-            chunks = self.text_splitter.split_text(content)
-            
-            for i, chunk in enumerate(chunks):
-                # Ajoute un suffixe au titre si le document est découpé
-                chunk_title = f"{title} (partie {i+1})" if len(chunks) > 1 else title
-                
-                doc = Document(
-                    page_content=chunk,
-                    metadata={
-                        "page_title": chunk_title,
-                        "page_url": link,
-                        "doc_id": f"{doc_id}_{i}" if len(chunks) > 1 else doc_id,
-                        "chunk_id": i,
-                        "total_chunks": len(chunks)
-                    }
-                )
-                documents.append(doc)
-        
-        # Création ou mise à jour du vector store
-        if self.vector_store is None:
-            self.vector_store = Chroma.from_documents(
-                documents=documents,
-                embedding_function=self.embeddings,
-                persist_directory=self.index_path
-            )
+    def _load_or_create_index(self):
+        """Charge un index existant ou en crée un nouveau."""
+        if os.path.exists(self.index_path) and os.path.isfile(self.index_path):
+            index = faiss.read_index(self.index_path)
         else:
-            self.vector_store.add_documents(documents)
+            # Création d'un nouvel index FAISS
+            index = faiss.IndexFlatL2(384)  # Dimension de all-MiniLM-L6-v2
+        return index
+
+    def _save_index(self):
+        """Sauvegarde l'index FAISS sur le disque."""
+        faiss.write_index(self.index, self.index_path)
+
+    def add(self, docs: Dict[str, List[str]]):
+        """Ajoute des documents à la base de connaissances."""
+        embeddings = []
+        metadata = []
         
-        # Persistance des données
-        self.vector_store.persist()
-    
-    async def aadd(self, docs: dict):
-        """Version asynchrone de add()"""
-        await asyncio.to_thread(self.add, docs)
+        for doc_id, (title, link, content) in docs.items():
+            # Découpage en chunks
+            chunks = self._split_text(content)
+            for i, chunk in enumerate(chunks):
+                embedding = self.embedding_model.encode(chunk)
+                embeddings.append(embedding)
+                metadata.append({
+                    "doc_id": f"{doc_id}_{i}",
+                    "title": title,
+                    "link": link,
+                    "content": chunk
+                })
+
+        embeddings = faiss.numpy.array(embeddings).astype("float32")
+        self.index.add(embeddings)  # Ajout à FAISS
+
+        # Sauvegarder les métadonnées
+        self._save_metadata(metadata)
+
+        # Sauvegarder l'index FAISS
+        self._save_index()
+
+    def _save_metadata(self, metadata):
+        """Sauvegarde les métadonnées des documents."""
+        with open(f"{self.index_path}_metadata.json", "w", encoding="utf-8") as f:
+            import json
+            json.dump(metadata, f, indent=4)
 
     def search(self, query: str, k: int = 3) -> str:
-        """Recherche les documents pertinents"""
-        if not self.vector_store:
-            return ""
-        
-        # Recherche des documents pertinents
-        results = self.vector_store.similarity_search_with_score(
-            query,
-            k=k
-        )
-        
-        # Construction du contexte
-        context = []
-        seen_docs = set()  # Pour éviter les doublons
-        
-        for doc, score in sorted(results, key=lambda x: x[1]):
-            if score > 1:
-                return ""
-            # Extraction des métadonnées
-            title = doc.metadata.get('page_title', 'Sans titre')
-            url = doc.metadata.get('page_url', 'URL non disponible')
-            doc_id = doc.metadata.get('doc_id', '').split('_')[0]  # ID de base sans numéro de chunk
-            
-            # Évite les doublons du même document
-            if doc_id not in seen_docs:
-                seen_docs.add(doc_id)
-                
-                # Calcul du score de pertinence en pourcentage (inverse car plus le score est bas, plus c'est pertinent)
-                relevance = max(0, min(100, (1 - score) * 100))
-                
-                # Formatage du contexte
-                context_entry = (
-                    f"[Source: {title}] (Pertinence: {relevance:.1f}%)\n"
-                    f"URL: {url}\n"
-                    f"{doc.page_content}\n"
-                )
-                context.append(context_entry)
-        
-        return "\n\n".join(context) if context else ""
+        """Recherche les documents pertinents."""
+        embedding = self.embedding_model.encode(query).astype("float32").reshape(1, -1)
+        distances, indices = self.index.search(embedding, k)
+
+        # Charger les métadonnées
+        with open(f"{self.index_path}_metadata.json", "r", encoding="utf-8") as f:
+            import json
+            metadata = json.load(f)
+
+        results = []
+        for idx, distance in zip(indices[0], distances[0]):
+            if idx < 0:  # Index invalide
+                continue
+            meta = metadata[idx]
+            relevance = max(0, min(100, (1 - distance) * 100))  # Score en pourcentage
+            result = (
+                f"[Source: {meta['title']}] (Pertinence: {relevance:.1f}%)\n"
+                f"URL: {meta['link']}\n"
+                f"{meta['content']}\n"
+            )
+            results.append(result)
+
+        return "\n\n".join(results) if results else "Aucun résultat pertinent trouvé."
+
+    def _split_text(self, text: str, chunk_size=1024, chunk_overlap=100) -> List[str]:
+        """Découpe un texte en chunks avec chevauchement."""
+        chunks = []
+        for i in range(0, len(text), chunk_size - chunk_overlap):
+            chunks.append(text[i:i + chunk_size])
+        return chunks
 
     def clear(self):
-        """Nettoie la base de connaissances (à appeler avec /quit)"""
-        if self.vector_store:
-            try:
-                self.vector_store.delete_collection()
-                if os.path.exists(self.index_path):
-                    shutil.rmtree(self.index_path)
-                self.vector_store = None
-            except Exception as e:
-                print(f"Erreur lors du nettoyage: {str(e)}")
+        """Nettoie la base de connaissances."""
+        if os.path.exists(self.index_path):
+            os.remove(self.index_path)
+        if os.path.exists(f"{self.index_path}_metadata.json"):
+            os.remove(f"{self.index_path}_metadata.json")
+        self.index = faiss.IndexFlatL2(384)  # Réinitialiser l'index
 
     def __len__(self):
-        """Retourne le nombre de documents dans la base"""
-        return self.vector_store._collection.count() if self.vector_store else 0
+        """Retourne le nombre de documents dans la base."""
+        return self.index.ntotal if self.index else 0
 
 
 if __name__ == "__main__":
@@ -135,25 +108,15 @@ if __name__ == "__main__":
     # Exemple de données
     docs = {
         "1": ["La DeLorean et ses caractéristiques", "http://example.com/1", """La DeLorean présente aux personnages du film deux difficultés essentielles, qui seront un enjeu de taille tour à tour dans l'épisode I puis dans l'épisode III. En effet, le voyage dans le temps s'effectue seulement si deux conditions sine qua non sont remplies : le « convecteur temporel » doit être rechargé en énergie ; la voiture doit atteindre la vitesse de 88 miles par heure (141,619 28 km/h). Pour être précis, c'est le convecteur temporel (« Flux Capacitor » en VO) qui a besoin d'être déplacé dans l'espace à cette vitesse."""],
-        "2": ["Tour Eiffel", "http://example.com/2", "La tour eiffel mesure 12m de haut et 156 km de large"]
+        "2": ["Tour Eiffel", "http://example.com/2", "La tour Eiffel mesure 324m de haut et est située à Paris."]
     }
 
-    async def main():
-        # Test d'ajout de documents
-        await rag.aadd(docs)
-        print(f"Nombre de documents dans la base: {len(rag)}")
-        
-        # Test de recherche
-        queries = [
-            "qu'elle vitesse la DeLorean doit atteindre ?",
-            "parle moi du convecteur temporel",
-            "que peux-tu me dire sur la tour eiffel ?"
-        ]
-        
-        for query in queries:
-            print(f"\nQuestion : {query}")
-            response = rag.search(query)
-            print("\nRéponse :")
-            print(response)
+    # Test d'ajout de documents
+    rag.add(docs)
+    print(f"Nombre de documents dans la base: {len(rag)}")
 
-    asyncio.run(main())
+    # Test de recherche
+    query = "qu'elle vitesse la DeLorean doit atteindre ?"
+    print("\nQuestion :", query)
+    print("\nRéponse :")
+    print(rag.search(query))

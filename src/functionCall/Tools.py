@@ -1,8 +1,9 @@
 
-from langchain_core.tools import Tool, tool
+import ollama_client
 from pydantic import BaseModel, Field
 from typing import Optional
 from src.WebpageResultsRetrieval import AIWebpageScraper
+from src.WebContentExtractor import WebContentExtractor
 from urllib.parse import urlparse
 
 class ScrapingInput(BaseModel):
@@ -21,7 +22,6 @@ class WebTools:
         except:
             return False
 
-    @tool("scrape_webpage", args_schema=ScrapingInput)
     async def scrape_webpage(self, url: str, extraction_description: Optional[str] = None) -> str:
         """Utiliser cet outil pour extraire des informations d'une page web.
         
@@ -36,26 +36,35 @@ class WebTools:
             return "URL invalide. Veuillez fournir une URL complète commençant par http:// ou https://"
         
         try:
-            scraper = AIWebpageScraper(url)
-            page_source = scraper.scrape_webpage()
+            # scraper = AIWebpageScraper(url)
+            scraper = WebContentExtractor(url=url, sb=None)
+            page_source = scraper.scrape_page()
             
             if not page_source:
                 return "Échec du scraping de la page."
             
-            extracted_text = scraper.extract_body_content(page_source)
-            if not extracted_text:
-                return "Aucun contenu lisible extrait."
+            extracted_text = scraper.extract_html_content(page_source) or "Aucun contenu lisible extrait."
             
-            cleaned_content = scraper.clean_body_content(extracted_text)
-            if extraction_description:
-                # Si une description spécifique est fournie, utiliser le parsing
-                content_chunks = scraper.split_dom_content(cleaned_content)
-                return scraper.parse_with_ollama(content_chunks, extraction_description)
+            # cleaned_content = scraper.clean_body_content(extracted_text)
+            # if extraction_description:
+            #     # Si une description spécifique est fournie, utiliser le parsing
+            #     content_chunks = scraper.split_dom_content(cleaned_content)
+            #     # return scraper.parse_with_ollama(content_chunks, extraction_description) # je trouve plus le AIWebpageScraper
+            #     return self.parse_with_ollama(content_chunks, extraction_description)
             
-            return cleaned_content
+            return extracted_text
 
         except Exception as e:
             return f"Erreur lors du scraping: {str(e)}"
+    
+    def parse_with_ollama(self, content_chunks, extraction_description):
+        """Envoie les morceaux de contenu à Ollama pour analyse."""
+        results = []
+        for chunk in content_chunks:
+            prompt = f"Extrait suivant : {chunk}\n\n{extraction_description}"
+            result = ollama_client.query(prompt)  
+            results.append(result)
+        return "\n".join(results)
 
     def get_tools(self):
         """Retourne la liste des outils disponibles"""

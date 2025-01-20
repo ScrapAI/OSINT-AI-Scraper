@@ -45,8 +45,7 @@ class User_chatBot:
                 func = functions_registry[func_name]['func']
                 result = func(**params)
                 input += (f" \n voici les resultas fournit par l'outil {func_name} : "+result)
-                # self.output = result
-                # yield result
+          
             except Exception as e:
                 self.output = f"Erreur lors de l'appel de la fonction {func_name} : {str(e)}"
                 yield self.output
