@@ -1,4 +1,4 @@
-
+from seleniumbase import SB
 import ollama_client
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -37,7 +37,7 @@ class WebTools:
         
         try:
             # scraper = AIWebpageScraper(url)
-            scraper = WebContentExtractor(url=url, sb=None)
+            scraper = WebContentExtractor(url=url, sb=SB)
             page_source = scraper.scrape_page()
             
             if not page_source:
